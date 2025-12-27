@@ -1,12 +1,14 @@
-FROM node:18-slim
+FROM node:20-bullseye
 
-RUN apt-get update && apt-get install -y ffmpeg
+# ffmpeg + font สำหรับ subtitles
+RUN apt-get update && apt-get install -y ffmpeg fonts-dejavu-core && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
-COPY package.json ./
-RUN npm install
+COPY package*.json ./
+RUN npm install --omit=dev
 
-COPY index.js ./
-
+COPY . .
+ENV PORT=3000
 EXPOSE 3000
-CMD ["node", "index.js"]
+
+CMD ["npm", "start"]
