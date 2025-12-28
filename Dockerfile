@@ -1,6 +1,5 @@
 FROM node:20-bullseye
 
-# Install ffmpeg (includes ffprobe)
 RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg \
   && rm -rf /var/lib/apt/lists/*
 
