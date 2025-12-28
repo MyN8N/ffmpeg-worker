@@ -7,21 +7,31 @@ const { spawn } = require("child_process");
 const app = express();
 const upload = multer({ dest: "/tmp" });
 
-// ==== 원하는 timing ====
+// ==== timing ====
 const VOICE_DELAY_SEC = 3;        // รอ 3 วิ แล้วค่อยเริ่มเสียงพูด+ซับ
 const TAIL_AFTER_VOICE_SEC = 5;   // พูดจบแล้วเล่นต่อ 5 วิค่อยจบ
 
-// ====== Performance / RAM knobs ======
-// ลด log ของ ffmpeg (ช่วยลด I/O และลดโอกาส memory spike จาก log)
-const FFMPEG_LOGLEVEL = "warning"; // "error" / "warning" / "info"
-
-// จำกัด threads (ช่วยลด peak RAM บางเคส) - ถ้าต้องการเร็วขึ้นค่อยลองเพิ่ม
+// ===== Performance / RAM knobs =====
+const FFMPEG_LOGLEVEL = "warning";
 const FFMPEG_THREADS = "1";
-
-// ถ้าต้องการประหยัดมากขึ้น: ลดความละเอียดลง (720x1280)
-// ถ้าคุณต้องการ 1080x1920 คงเดิม ให้ใช้ 1080,1920
 const OUT_W = 1080;
 const OUT_H = 1920;
+
+// ===== Subtitle knobs (ปรับได้ง่าย) =====
+// ทำให้ซับมาพร้อมเสียง: ซับ “นำ” เล็กน้อย (ms)
+const SUBTITLE_LEAD_MS = 200; // ถ้ายังช้า เพิ่มเป็น 300-500 / ถ้าเร็วเกิน ลดเหลือ 0
+
+// ขนาด/สไตล์ซับ
+const SUBTITLE_FONT = "Arial";
+const SUBTITLE_FONT_SIZE = 34;    // << ลดลงจาก 54
+const SUBTITLE_MAX_CHARS = 42;    // << 1 บรรทัด ถ้ายาวกว่านี้จะตัดคำ + …
+
+// ตำแหน่งกลางจอ (Alignment=5 = middle-center)
+// ถ้าอยาก “ต่ำลงนิด” ใช้ Alignment=2 แล้วปรับ MarginV
+const SUBTITLE_ALIGNMENT = 5; // 5 = กลางจอ, 2 = ล่างกลาง
+
+// MarginV มีผลชัดเมื่อ Alignment=2 (ล่างกลาง)
+const SUBTITLE_MARGIN_V = 160;
 
 // ===== Utils =====
 function safeUnlink(p) {
@@ -29,7 +39,7 @@ function safeUnlink(p) {
   try { fs.unlinkSync(p); } catch {}
 }
 
-// ✅ แก้ RAM หลัก: เก็บ stdout/stderr แค่ "ท้ายสุด" จำกัดขนาด
+// จำกัด log เพื่อกันกิน RAM จาก stderr/stdout
 function runCmd(bin, args, { maxLogKB = 64 } = {}) {
   return new Promise((resolve, reject) => {
     const p = spawn(bin, args, { stdio: ["ignore", "pipe", "pipe"] });
@@ -39,7 +49,6 @@ function runCmd(bin, args, { maxLogKB = 64 } = {}) {
     let stdoutBuf = Buffer.alloc(0);
 
     const append = (buf, chunk) => {
-      // เก็บท้ายสุดอย่างเดียว
       buf = Buffer.concat([buf, chunk]);
       if (buf.length > MAX) buf = buf.slice(buf.length - MAX);
       return buf;
@@ -53,14 +62,13 @@ function runCmd(bin, args, { maxLogKB = 64 } = {}) {
     p.on("close", (code) => {
       const stderr = stderrBuf.toString("utf8");
       const stdout = stdoutBuf.toString("utf8");
-
       if (code === 0) return resolve({ stdout, stderr });
       reject(new Error(`${bin} failed (code=${code}):\n${stderr || stdout}`));
     });
   });
 }
 
-// ใช้ ffprobe หา duration (วินาที)
+// ffprobe duration
 async function getMediaDurationSeconds(filePath) {
   const args = [
     "-v", "error",
@@ -74,7 +82,7 @@ async function getMediaDurationSeconds(filePath) {
   return v;
 }
 
-// ===== SRT SHIFT (เลื่อนซับ +3s ให้ตรงกับเสียงพูดที่เริ่มช้า) =====
+// ===== SRT helpers =====
 function parseTimeToMs(t) {
   const m = /^(\d{2}):(\d{2}):(\d{2}),(\d{3})$/.exec(t.trim());
   if (!m) return null;
@@ -93,7 +101,8 @@ function msToTime(ms) {
   return `${pad2(hh)}:${pad2(mm)}:${pad2(ss)},${pad3(mmm)}`;
 }
 
-function shiftSrtContent(srtText, offsetMs) {
+// 1) Shift timecodes
+function shiftSrtTimecodes(srtText, offsetMs) {
   const lines = srtText.split(/\r?\n/);
   return lines.map((line) => {
     const idx = line.indexOf("-->");
@@ -104,7 +113,7 @@ function shiftSrtContent(srtText, offsetMs) {
 
     const a = parts[0].trim();
     const bFull = parts[1].trim();
-    const b = bFull.split(/\s+/)[0]; // เวลา end
+    const b = bFull.split(/\s+/)[0];
     const trailing = bFull.slice(b.length);
 
     const aMs = parseTimeToMs(a);
@@ -115,14 +124,49 @@ function shiftSrtContent(srtText, offsetMs) {
   }).join("\n");
 }
 
+// 2) Normalize subtitle text: รวมหลายบรรทัดให้เป็นบรรทัดเดียว + ตัดคำให้ไม่ยาวเกิน
+function normalizeSrtToSingleLine(srtText, maxChars = 42) {
+  // แยกเป็น blocks ด้วยบรรทัดว่าง
+  const blocks = srtText.split(/\r?\n\r?\n/);
+
+  const trimToWord = (str, limit) => {
+    const s = str.replace(/\s+/g, " ").trim();
+    if (s.length <= limit) return s;
+
+    // ตัดแบบไม่หั่นกลางคำ
+    const cut = s.slice(0, limit - 1);
+    const lastSpace = cut.lastIndexOf(" ");
+    const safeCut = lastSpace > 18 ? cut.slice(0, lastSpace) : cut; // กันกรณีคำยาวมาก
+    return safeCut.trim() + "…";
+  };
+
+  const out = blocks.map((blk) => {
+    const lines = blk.split(/\r?\n/).filter(l => l !== "");
+    if (lines.length < 3) return blk; // block แปลก ๆ ปล่อยผ่าน
+
+    const idxLine = lines[0];
+    const timeLine = lines[1];
+
+    // text อาจหลายบรรทัด -> รวมเป็นบรรทัดเดียว
+    const textLines = lines.slice(2);
+    const merged = textLines.join(" ").replace(/\s+/g, " ").trim();
+
+    const finalText = trimToWord(merged, maxChars);
+
+    return `${idxLine}\n${timeLine}\n${finalText}`;
+  });
+
+  return out.join("\n\n") + "\n";
+}
+
 /**
  * POST /render
  * form-data binary fields:
- * - video (required): background video (mp4/mov)
- * - voice (required): TTS voice (mp3/wav)
- * - music (optional): background music (wav/mp3)  <-- เริ่มทันที + loop
- * - subtitle (optional): .srt ที่ timestamp ตรงกับเสียงพูดเริ่มที่ 0s
- * - logo (optional): .png
+ * - video (required)
+ * - voice (required)
+ * - music (optional)
+ * - subtitle (optional) .srt (timestamp เริ่มที่ 0s ของเสียงพูด)
+ * - logo (optional) .png
  */
 app.post(
   "/render",
@@ -146,9 +190,11 @@ app.post(
     const logoFile = req.files?.logo?.[0] || null;
 
     const outPath = path.join("/tmp", `out_${Date.now()}.mp4`);
-    const offsetMs = VOICE_DELAY_SEC * 1000;
 
-    let shiftedSubtitlePath = null;
+    // ซับควรเริ่มพร้อมเสียงที่ delay 3 วิ แต่ “นำ” นิดหน่อยให้รู้สึกมาทันเสียง
+    const offsetMs = (VOICE_DELAY_SEC * 1000) - SUBTITLE_LEAD_MS;
+
+    let processedSubtitlePath = null;
 
     const cleanupAll = () => {
       safeUnlink(outPath);
@@ -157,70 +203,73 @@ app.post(
       safeUnlink(musicFile?.path);
       safeUnlink(logoFile?.path);
       safeUnlink(subtitleFile?.path);
-      safeUnlink(shiftedSubtitlePath);
+      safeUnlink(processedSubtitlePath);
     };
 
     try {
-      // 1) duration ของ voice
+      // 1) duration
       const voiceDur = await getMediaDurationSeconds(voiceFile.path);
       const totalDur = voiceDur + VOICE_DELAY_SEC + TAIL_AFTER_VOICE_SEC;
 
-      // 2) shift subtitle +3s
+      // 2) process subtitle: normalize(1 line) + shift timecodes
       if (subtitleFile) {
         const raw = fs.readFileSync(subtitleFile.path, "utf8");
-        const shifted = shiftSrtContent(raw, offsetMs);
-        shiftedSubtitlePath = path.join("/tmp", `shifted_${Date.now()}.srt`);
-        fs.writeFileSync(shiftedSubtitlePath, shifted, "utf8");
+
+        // ทำให้เป็น 1 บรรทัด + ตัดคำให้อ่านรู้เรื่อง
+        const normalized = normalizeSrtToSingleLine(raw, SUBTITLE_MAX_CHARS);
+
+        // shift ให้เริ่มพร้อมเสียง (3s) และนำเล็กน้อย
+        const shifted = shiftSrtTimecodes(normalized, offsetMs);
+
+        processedSubtitlePath = path.join("/tmp", `subtitle_${Date.now()}.srt`);
+        fs.writeFileSync(processedSubtitlePath, shifted, "utf8");
       }
 
       // 3) ffmpeg inputs
-      // 0: video (loop)
-      // 1: voice
-      // 2: music (loop) optional
-      // 3: logo optional (index จะเปลี่ยนตามมี music)
       const args = [];
-
-      // ลด log เพื่อความนิ่ง
       args.push("-hide_banner", "-loglevel", FFMPEG_LOGLEVEL);
 
-      // loop video ไปเรื่อย ๆ
+      // 0: video loop
       args.push("-stream_loop", "-1", "-i", videoFile.path);
 
-      // voice
+      // 1: voice
       args.push("-i", voiceFile.path);
 
-      // music loop
+      // 2: music loop (optional)
       if (musicFile) args.push("-stream_loop", "-1", "-i", musicFile.path);
 
-      // logo
+      // logo (optional)
       if (logoFile) args.push("-i", logoFile.path);
 
       // 4) filter graph
       const vf = [];
       const af = [];
 
-      // --- Video: 9:16 + trim ตาม totalDur
+      // --- Video base
       vf.push(
         `[0:v]scale=${OUT_W}:${OUT_H}:force_original_aspect_ratio=increase,` +
         `crop=${OUT_W}:${OUT_H},setsar=1,fps=30,` +
         `trim=duration=${totalDur},setpts=PTS-STARTPTS[v0]`
       );
 
-      // --- Subtitles
-      if (shiftedSubtitlePath) {
+      // --- Subtitles style
+      if (processedSubtitlePath) {
         const forceStyle =
-          "FontName=Arial,FontSize=54,PrimaryColour=&H00FFFFFF," +
-          "OutlineColour=&H00000000,BorderStyle=1,Outline=3,Shadow=1," +
-          "Alignment=2,MarginV=140";
+          `FontName=${SUBTITLE_FONT},` +
+          `FontSize=${SUBTITLE_FONT_SIZE},` +
+          `PrimaryColour=&H00FFFFFF,` +
+          `OutlineColour=&H00000000,` +
+          `BorderStyle=1,Outline=3,Shadow=1,` +
+          `Alignment=${SUBTITLE_ALIGNMENT},` +
+          `MarginV=${SUBTITLE_MARGIN_V},` +
+          `WrapStyle=2`; // 2 = no wrap (บังคับ 1 บรรทัด)
 
-        // NOTE: path ที่มีอักขระพิเศษ/ช่องว่าง บางทีต้อง escape
-        // /tmp/... ปกติปลอดภัย
-        vf.push(`[v0]subtitles=${shiftedSubtitlePath}:force_style='${forceStyle}'[v1]`);
+        vf.push(`[v0]subtitles=${processedSubtitlePath}:force_style='${forceStyle}'[v1]`);
       } else {
         vf.push(`[v0]null[v1]`);
       }
 
-      // --- Logo overlay (มุมขวาบน)
+      // --- Logo overlay
       if (logoFile) {
         const logoIndex = musicFile ? 3 : 2;
         vf.push(`[${logoIndex}:v]scale=220:-1[lg]`);
@@ -230,8 +279,10 @@ app.post(
       }
 
       // --- Audio timeline
+      const voiceDelayMs = VOICE_DELAY_SEC * 1000;
+
       af.push(`anullsrc=channel_layout=stereo:sample_rate=48000,atrim=0:${totalDur}[a_sil]`);
-      af.push(`[1:a]aresample=48000,atrim=0:${voiceDur},adelay=${offsetMs}|${offsetMs}[a_voice_d]`);
+      af.push(`[1:a]aresample=48000,atrim=0:${voiceDur},adelay=${voiceDelayMs}|${voiceDelayMs}[a_voice_d]`);
 
       if (musicFile) {
         af.push(`[2:a]aresample=48000,volume=0.22[am]`);
@@ -247,14 +298,14 @@ app.post(
         "-map", "[vout]",
         "-map", "[aout]",
         "-c:v", "libx264",
-        "-preset", "veryfast",      // ถ้ายัง OOM/ช้า ลอง "ultrafast"
+        "-preset", "veryfast",
         "-crf", "23",
         "-pix_fmt", "yuv420p",
-        "-threads", FFMPEG_THREADS, // ช่วยคุม peak RAM
+        "-threads", FFMPEG_THREADS,
         "-c:a", "aac",
         "-b:a", "192k",
         "-movflags", "+faststart",
-        "-t", String(totalDur),     // ล็อกจบตาม totalDur
+        "-t", String(totalDur),
         outPath
       );
 
@@ -266,7 +317,6 @@ app.post(
       const stream = fs.createReadStream(outPath);
       stream.pipe(res);
 
-      // cleanup หลังส่งเสร็จ
       const done = () => cleanupAll();
       stream.on("close", done);
       stream.on("error", done);
@@ -281,5 +331,4 @@ app.post(
 );
 
 app.get("/", (req, res) => res.json({ ok: true, endpoint: "/render" }));
-
 app.listen(3000, () => console.log("FFmpeg worker listening on :3000"));
