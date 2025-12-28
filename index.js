@@ -5,9 +5,11 @@ const path = require("path");
 const { spawn } = require("child_process");
 
 const app = express();
-
-// ใช้ /tmp รองรับ binary ได้ดีใน container
 const upload = multer({ dest: "/tmp" });
+
+// ==== 원하는 timing ====
+const VOICE_DELAY_SEC = 3;        // รอ 3 วิ แล้วค่อยเริ่มเสียงพูด+ซับ
+const TAIL_AFTER_VOICE_SEC = 5;   // พูดจบแล้วเล่นต่อ 5 วิค่อยจบ
 
 function safeUnlink(p) {
   if (!p) return;
@@ -28,8 +30,8 @@ function runCmd(bin, args) {
   });
 }
 
+// ใช้ ffprobe หา duration (วินาที)
 async function getMediaDurationSeconds(filePath) {
-  // ffprobe -> duration (seconds)
   const args = [
     "-v", "error",
     "-show_entries", "format=duration",
@@ -38,44 +40,30 @@ async function getMediaDurationSeconds(filePath) {
   ];
   const { stdout } = await runCmd("ffprobe", args);
   const v = parseFloat(String(stdout).trim());
-  if (!Number.isFinite(v) || v <= 0) {
-    throw new Error("Cannot read duration from ffprobe");
-  }
+  if (!Number.isFinite(v) || v <= 0) throw new Error("Cannot read duration from ffprobe");
   return v;
 }
 
-// ===== SRT SHIFT +3s =====
-// รับ SRT ที่เริ่มจาก 0:00 ของเสียงพูด แล้วเลื่อนเวลาไปข้างหน้า offsetMs
+// ===== SRT SHIFT (เลื่อนซับ +3s ให้ตรงกับเสียงพูดที่เริ่มช้า) =====
 function parseTimeToMs(t) {
-  // "HH:MM:SS,mmm"
   const m = /^(\d{2}):(\d{2}):(\d{2}),(\d{3})$/.exec(t.trim());
   if (!m) return null;
-  const hh = Number(m[1]);
-  const mm = Number(m[2]);
-  const ss = Number(m[3]);
-  const ms = Number(m[4]);
+  const hh = Number(m[1]), mm = Number(m[2]), ss = Number(m[3]), ms = Number(m[4]);
   return (((hh * 60 + mm) * 60 + ss) * 1000 + ms);
 }
-
 function msToTime(ms) {
   if (ms < 0) ms = 0;
-  const hh = Math.floor(ms / 3600000);
-  ms -= hh * 3600000;
-  const mm = Math.floor(ms / 60000);
-  ms -= mm * 60000;
-  const ss = Math.floor(ms / 1000);
-  ms -= ss * 1000;
+  const hh = Math.floor(ms / 3600000); ms -= hh * 3600000;
+  const mm = Math.floor(ms / 60000);   ms -= mm * 60000;
+  const ss = Math.floor(ms / 1000);    ms -= ss * 1000;
   const mmm = ms;
-
   const pad2 = (n) => String(n).padStart(2, "0");
   const pad3 = (n) => String(n).padStart(3, "0");
   return `${pad2(hh)}:${pad2(mm)}:${pad2(ss)},${pad3(mmm)}`;
 }
-
 function shiftSrtContent(srtText, offsetMs) {
-  // เปลี่ยนทุกบรรทัด timing: "a --> b"
   const lines = srtText.split(/\r?\n/);
-  const out = lines.map((line) => {
+  return lines.map((line) => {
     const idx = line.indexOf("-->");
     if (idx === -1) return line;
 
@@ -83,59 +71,58 @@ function shiftSrtContent(srtText, offsetMs) {
     if (parts.length !== 2) return line;
 
     const a = parts[0].trim();
-    const b = parts[1].trim().split(/\s+/)[0]; // กันกรณีมี trailing settings
+    const bFull = parts[1].trim();
+    const b = bFull.split(/\s+/)[0]; // เวลา end
+    const trailing = bFull.slice(b.length);
+
     const aMs = parseTimeToMs(a);
     const bMs = parseTimeToMs(b);
     if (aMs === null || bMs === null) return line;
 
-    const newA = msToTime(aMs + offsetMs);
-    const newB = msToTime(bMs + offsetMs);
-
-    // รักษา trailing หลังเวลา (เช่น position) ถ้ามี
-    const trailing = parts[1].trim().slice(b.length);
-    return `${newA} --> ${newB}${trailing}`;
-  });
-  return out.join("\n");
+    return `${msToTime(aMs + offsetMs)} --> ${msToTime(bMs + offsetMs)}${trailing}`;
+  }).join("\n");
 }
 
+/**
+ * POST /render
+ * form-data binary fields:
+ * - video (required): background video (mp4/mov)
+ * - voice (required): TTS voice (mp3/wav)
+ * - music (optional): background music (wav/mp3)  <-- เริ่มทันที + loop
+ * - subtitle (optional): .srt ที่ timestamp ตรงกับเสียงพูดเริ่มที่ 0s
+ * - logo (optional): .png
+ */
 app.post(
   "/render",
   upload.fields([
-    { name: "video", maxCount: 1 },     // binary video background
-    { name: "voice", maxCount: 1 },     // TTS voice
-    { name: "music", maxCount: 1 },     // optional
-    { name: "logo", maxCount: 1 },      // optional
-    { name: "subtitle", maxCount: 1 }   // optional .srt (timestamp aligned with voice starting at 0)
+    { name: "video", maxCount: 1 },
+    { name: "voice", maxCount: 1 },
+    { name: "music", maxCount: 1 },
+    { name: "subtitle", maxCount: 1 },
+    { name: "logo", maxCount: 1 },
   ]),
   async (req, res) => {
     const videoFile = req.files?.video?.[0];
     const voiceFile = req.files?.voice?.[0];
-
     if (!videoFile || !voiceFile) {
-      return res.status(400).json({
-        error: "Missing required files: video, voice"
-      });
+      return res.status(400).json({ error: "Missing required files: video, voice" });
     }
 
     const musicFile = req.files?.music?.[0] || null;
-    const logoFile = req.files?.logo?.[0] || null;
     const subtitleFile = req.files?.subtitle?.[0] || null;
+    const logoFile = req.files?.logo?.[0] || null;
 
     const outPath = path.join("/tmp", `out_${Date.now()}.mp4`);
-
-    // Timing rules
-    const VOICE_DELAY_SEC = 3;
-    const TAIL_AFTER_VOICE_SEC = 5;
     const offsetMs = VOICE_DELAY_SEC * 1000;
 
     let shiftedSubtitlePath = null;
 
     try {
-      // 1) หา duration เสียงพูด เพื่อคุมความยาวทั้งหมดแบบเป๊ะ
+      // 1) duration ของ voice
       const voiceDur = await getMediaDurationSeconds(voiceFile.path);
       const totalDur = voiceDur + VOICE_DELAY_SEC + TAIL_AFTER_VOICE_SEC;
 
-      // 2) ถ้ามี subtitle -> shift +3s ให้ตรงกับเสียงพูดที่ดีเลย์
+      // 2) shift subtitle +3s
       if (subtitleFile) {
         const raw = fs.readFileSync(subtitleFile.path, "utf8");
         const shifted = shiftSrtContent(raw, offsetMs);
@@ -143,56 +130,40 @@ app.post(
         fs.writeFileSync(shiftedSubtitlePath, shifted, "utf8");
       }
 
-      // 3) เตรียม ffmpeg args
-      // Inputs:
-      // 0 = video (loop)
-      // 1 = voice
-      // 2 = music (loop) [optional]
-      // 3 = logo [optional]  (index จะเปลี่ยนตามมี/ไม่มี music)
+      // 3) ffmpeg inputs
+      // 0: video (loop)
+      // 1: voice
+      // 2: music (loop) optional
+      // 3: logo optional (index จะเปลี่ยนตามมี music)
       const args = [];
-
-      // loop background video
       args.push("-stream_loop", "-1", "-i", videoFile.path);
-
-      // voice
       args.push("-i", voiceFile.path);
 
-      // music (optional) loop
-      if (musicFile) {
-        args.push("-stream_loop", "-1", "-i", musicFile.path);
-      }
+      if (musicFile) args.push("-stream_loop", "-1", "-i", musicFile.path);
+      if (logoFile) args.push("-i", logoFile.path);
 
-      // logo (optional)
-      if (logoFile) {
-        args.push("-i", logoFile.path);
-      }
-
+      // 4) filter graph
       const vf = [];
       const af = [];
 
-      // Video: force 9:16 1080x1920 + fps
+      // --- Video: 9:16 1080x1920 + ตัดความยาว = totalDur
       vf.push(
         `[0:v]scale=1080:1920:force_original_aspect_ratio=increase,` +
         `crop=1080:1920,setsar=1,fps=30,trim=duration=${totalDur},setpts=PTS-STARTPTS[v0]`
       );
 
-      // Subtitles (burn-in) -> สีขาว ตัวใหญ่ อ่านง่าย
-      // NOTE: ใช้ libass force_style ได้แม้ไฟล์เป็น .srt
+      // --- Subtitles: สีขาว ตัวใหญ่ อ่านง่าย (ทีละบรรทัดตาม SRT)
       if (shiftedSubtitlePath) {
-        // ตัวอย่าง style: font ใหญ่, สีขาว, outline ดำให้อ่านง่าย
-        // PrimaryColour ASS: &HAABBGGRR => white = &H00FFFFFF
         const forceStyle =
           "FontName=Arial,FontSize=54,PrimaryColour=&H00FFFFFF," +
           "OutlineColour=&H00000000,BorderStyle=1,Outline=3,Shadow=1," +
-          "Alignment=2,MarginV=140"; // Alignment=2 = bottom center, MarginV ดันขึ้นจากขอบล่าง
-
-        // ใส่ subtitles หลังจากตัด/เซ็ต fps แล้ว
+          "Alignment=2,MarginV=140";
         vf.push(`[v0]subtitles=${shiftedSubtitlePath}:force_style='${forceStyle}'[v1]`);
       } else {
         vf.push(`[v0]null[v1]`);
       }
 
-      // Logo overlay (top-right)
+      // --- Logo overlay (มุมขวาบน)
       if (logoFile) {
         const logoIndex = musicFile ? 3 : 2;
         vf.push(`[${logoIndex}:v]scale=220:-1[lg]`);
@@ -201,23 +172,25 @@ app.post(
         vf.push(`[v1]null[vout]`);
       }
 
-      // Audio:
-      // - music starts immediately (0s)
-      // - voice starts at +3s (adelay)
-      // - after voice ends, music continues until totalDur (voice+8s)
-      // - output trimmed exactly to totalDur
-      af.push(`[1:a]atrim=0:${voiceDur},adelay=${offsetMs}|${offsetMs},asetpts=N/SR/TB[a_voice]`);
+      // --- Audio timeline (แก้ delay/tail ให้เป๊ะ)
+      // สร้าง silent bed ยาว totalDur แล้ว mix เสียงต่างๆ ลงไป
+      // music เริ่มทันที, voice เริ่มหลัง 3s
+      af.push(`anullsrc=channel_layout=stereo:sample_rate=48000,atrim=0:${totalDur}[a_sil]`);
+
+      // voice -> resample -> delay 3s
+      af.push(`[1:a]aresample=48000,atrim=0:${voiceDur},adelay=${offsetMs}|${offsetMs}[a_voice_d]`);
 
       if (musicFile) {
-        af.push(`[2:a]volume=0.22,asetpts=N/SR/TB[a_music]`);
-        // amix longest เพราะ music loop ยาวกว่า -> แล้วค่อย trim ทั้งหมดให้เท่ากับ totalDur
-        af.push(`[a_music][a_voice]amix=inputs=2:duration=longest:dropout_transition=2,atrim=0:${totalDur}[aout]`);
+        // music เริ่มทันที และ loop มาแล้วจาก -stream_loop
+        // ลดเสียงเพลงให้เบากว่าเสียงพูด
+        af.push(`[2:a]aresample=48000,volume=0.22[am]`);
+
+        // mix: silent bed + music + voice_delayed
+        // แล้วตัดความยาวให้ totalDur เป๊ะ
+        af.push(`[a_sil][am][a_voice_d]amix=inputs=3:duration=longest:dropout_transition=2,atrim=0:${totalDur}[aout]`);
       } else {
-        // ไม่มีเพลง ก็ให้มี silence ก่อน 3s แล้วเสียงพูด แล้ว tail 5s
-        // ทำ silence 3s + voice + silence 5s
-        af.push(`anullsrc=channel_layout=stereo:sample_rate=48000,atrim=0:${VOICE_DELAY_SEC}[a_pre]`);
-        af.push(`anullsrc=channel_layout=stereo:sample_rate=48000,atrim=0:${TAIL_AFTER_VOICE_SEC}[a_tail]`);
-        af.push(`[a_pre][a_voice][a_tail]concat=n=3:v=0:a=1[aout]`);
+        // ไม่มีเพลง: silent bed + voice_delayed ก็พอ (จะได้มีช่วงก่อน 3s และท้าย 5s เป็นเงียบ)
+        af.push(`[a_sil][a_voice_d]amix=inputs=2:duration=longest:dropout_transition=2,atrim=0:${totalDur}[aout]`);
       }
 
       const filterComplex = [...vf, ...af].join(";");
@@ -226,8 +199,6 @@ app.post(
         "-filter_complex", filterComplex,
         "-map", "[vout]",
         "-map", "[aout]",
-
-        // Encode
         "-c:v", "libx264",
         "-preset", "veryfast",
         "-crf", "23",
@@ -235,17 +206,12 @@ app.post(
         "-c:a", "aac",
         "-b:a", "192k",
         "-movflags", "+faststart",
-
-        // คุมความยาวเอาตาม totalDur ชัวร์ที่สุด
-        "-t", String(totalDur),
-
+        "-t", String(totalDur),        // ล็อกจบทุกอย่างตาม totalDur
         outPath
       );
 
-      // 4) run ffmpeg
       await runCmd("ffmpeg", args);
 
-      // 5) ส่งไฟล์ mp4 กลับแบบ binary
       res.setHeader("Content-Type", "video/mp4");
       res.setHeader("Content-Disposition", `attachment; filename="short.mp4"`);
 
@@ -271,17 +237,11 @@ app.post(
       safeUnlink(subtitleFile?.path);
       safeUnlink(shiftedSubtitlePath);
 
-      return res.status(500).json({
-        error: String(err?.message || err)
-      });
+      return res.status(500).json({ error: String(err?.message || err) });
     }
   }
 );
 
-app.get("/", (req, res) => {
-  res.json({ ok: true, service: "ffmpeg-worker", endpoint: "/render" });
-});
+app.get("/", (req, res) => res.json({ ok: true, endpoint: "/render" }));
 
-app.listen(3000, () => {
-  console.log("FFmpeg worker listening on :3000");
-});
+app.listen(3000, () => console.log("FFmpeg worker listening on :3000"));
