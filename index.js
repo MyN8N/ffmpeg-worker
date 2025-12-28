@@ -11,21 +11,51 @@ const upload = multer({ dest: "/tmp" });
 const VOICE_DELAY_SEC = 3;        // รอ 3 วิ แล้วค่อยเริ่มเสียงพูด+ซับ
 const TAIL_AFTER_VOICE_SEC = 5;   // พูดจบแล้วเล่นต่อ 5 วิค่อยจบ
 
+// ====== Performance / RAM knobs ======
+// ลด log ของ ffmpeg (ช่วยลด I/O และลดโอกาส memory spike จาก log)
+const FFMPEG_LOGLEVEL = "warning"; // "error" / "warning" / "info"
+
+// จำกัด threads (ช่วยลด peak RAM บางเคส) - ถ้าต้องการเร็วขึ้นค่อยลองเพิ่ม
+const FFMPEG_THREADS = "1";
+
+// ถ้าต้องการประหยัดมากขึ้น: ลดความละเอียดลง (720x1280)
+// ถ้าคุณต้องการ 1080x1920 คงเดิม ให้ใช้ 1080,1920
+const OUT_W = 1080;
+const OUT_H = 1920;
+
+// ===== Utils =====
 function safeUnlink(p) {
   if (!p) return;
   try { fs.unlinkSync(p); } catch {}
 }
 
-function runCmd(bin, args) {
+// ✅ แก้ RAM หลัก: เก็บ stdout/stderr แค่ "ท้ายสุด" จำกัดขนาด
+function runCmd(bin, args, { maxLogKB = 64 } = {}) {
   return new Promise((resolve, reject) => {
     const p = spawn(bin, args, { stdio: ["ignore", "pipe", "pipe"] });
-    let stderr = "";
-    let stdout = "";
-    p.stderr.on("data", (d) => (stderr += d.toString()));
-    p.stdout.on("data", (d) => (stdout += d.toString()));
+
+    const MAX = maxLogKB * 1024;
+    let stderrBuf = Buffer.alloc(0);
+    let stdoutBuf = Buffer.alloc(0);
+
+    const append = (buf, chunk) => {
+      // เก็บท้ายสุดอย่างเดียว
+      buf = Buffer.concat([buf, chunk]);
+      if (buf.length > MAX) buf = buf.slice(buf.length - MAX);
+      return buf;
+    };
+
+    p.stderr.on("data", (d) => { stderrBuf = append(stderrBuf, d); });
+    p.stdout.on("data", (d) => { stdoutBuf = append(stdoutBuf, d); });
+
+    p.on("error", (err) => reject(err));
+
     p.on("close", (code) => {
+      const stderr = stderrBuf.toString("utf8");
+      const stdout = stdoutBuf.toString("utf8");
+
       if (code === 0) return resolve({ stdout, stderr });
-      reject(new Error(`${bin} failed (code=${code}):\n${stderr}`));
+      reject(new Error(`${bin} failed (code=${code}):\n${stderr || stdout}`));
     });
   });
 }
@@ -36,9 +66,9 @@ async function getMediaDurationSeconds(filePath) {
     "-v", "error",
     "-show_entries", "format=duration",
     "-of", "default=noprint_wrappers=1:nokey=1",
-    filePath
+    filePath,
   ];
-  const { stdout } = await runCmd("ffprobe", args);
+  const { stdout } = await runCmd("ffprobe", args, { maxLogKB: 16 });
   const v = parseFloat(String(stdout).trim());
   if (!Number.isFinite(v) || v <= 0) throw new Error("Cannot read duration from ffprobe");
   return v;
@@ -57,10 +87,12 @@ function msToTime(ms) {
   const mm = Math.floor(ms / 60000);   ms -= mm * 60000;
   const ss = Math.floor(ms / 1000);    ms -= ss * 1000;
   const mmm = ms;
+
   const pad2 = (n) => String(n).padStart(2, "0");
   const pad3 = (n) => String(n).padStart(3, "0");
   return `${pad2(hh)}:${pad2(mm)}:${pad2(ss)},${pad3(mmm)}`;
 }
+
 function shiftSrtContent(srtText, offsetMs) {
   const lines = srtText.split(/\r?\n/);
   return lines.map((line) => {
@@ -104,6 +136,7 @@ app.post(
   async (req, res) => {
     const videoFile = req.files?.video?.[0];
     const voiceFile = req.files?.voice?.[0];
+
     if (!videoFile || !voiceFile) {
       return res.status(400).json({ error: "Missing required files: video, voice" });
     }
@@ -116,6 +149,16 @@ app.post(
     const offsetMs = VOICE_DELAY_SEC * 1000;
 
     let shiftedSubtitlePath = null;
+
+    const cleanupAll = () => {
+      safeUnlink(outPath);
+      safeUnlink(videoFile?.path);
+      safeUnlink(voiceFile?.path);
+      safeUnlink(musicFile?.path);
+      safeUnlink(logoFile?.path);
+      safeUnlink(subtitleFile?.path);
+      safeUnlink(shiftedSubtitlePath);
+    };
 
     try {
       // 1) duration ของ voice
@@ -136,28 +179,42 @@ app.post(
       // 2: music (loop) optional
       // 3: logo optional (index จะเปลี่ยนตามมี music)
       const args = [];
+
+      // ลด log เพื่อความนิ่ง
+      args.push("-hide_banner", "-loglevel", FFMPEG_LOGLEVEL);
+
+      // loop video ไปเรื่อย ๆ
       args.push("-stream_loop", "-1", "-i", videoFile.path);
+
+      // voice
       args.push("-i", voiceFile.path);
 
+      // music loop
       if (musicFile) args.push("-stream_loop", "-1", "-i", musicFile.path);
+
+      // logo
       if (logoFile) args.push("-i", logoFile.path);
 
       // 4) filter graph
       const vf = [];
       const af = [];
 
-      // --- Video: 9:16 1080x1920 + ตัดความยาว = totalDur
+      // --- Video: 9:16 + trim ตาม totalDur
       vf.push(
-        `[0:v]scale=1080:1920:force_original_aspect_ratio=increase,` +
-        `crop=1080:1920,setsar=1,fps=30,trim=duration=${totalDur},setpts=PTS-STARTPTS[v0]`
+        `[0:v]scale=${OUT_W}:${OUT_H}:force_original_aspect_ratio=increase,` +
+        `crop=${OUT_W}:${OUT_H},setsar=1,fps=30,` +
+        `trim=duration=${totalDur},setpts=PTS-STARTPTS[v0]`
       );
 
-      // --- Subtitles: สีขาว ตัวใหญ่ อ่านง่าย (ทีละบรรทัดตาม SRT)
+      // --- Subtitles
       if (shiftedSubtitlePath) {
         const forceStyle =
           "FontName=Arial,FontSize=54,PrimaryColour=&H00FFFFFF," +
           "OutlineColour=&H00000000,BorderStyle=1,Outline=3,Shadow=1," +
           "Alignment=2,MarginV=140";
+
+        // NOTE: path ที่มีอักขระพิเศษ/ช่องว่าง บางทีต้อง escape
+        // /tmp/... ปกติปลอดภัย
         vf.push(`[v0]subtitles=${shiftedSubtitlePath}:force_style='${forceStyle}'[v1]`);
       } else {
         vf.push(`[v0]null[v1]`);
@@ -172,24 +229,14 @@ app.post(
         vf.push(`[v1]null[vout]`);
       }
 
-      // --- Audio timeline (แก้ delay/tail ให้เป๊ะ)
-      // สร้าง silent bed ยาว totalDur แล้ว mix เสียงต่างๆ ลงไป
-      // music เริ่มทันที, voice เริ่มหลัง 3s
+      // --- Audio timeline
       af.push(`anullsrc=channel_layout=stereo:sample_rate=48000,atrim=0:${totalDur}[a_sil]`);
-
-      // voice -> resample -> delay 3s
       af.push(`[1:a]aresample=48000,atrim=0:${voiceDur},adelay=${offsetMs}|${offsetMs}[a_voice_d]`);
 
       if (musicFile) {
-        // music เริ่มทันที และ loop มาแล้วจาก -stream_loop
-        // ลดเสียงเพลงให้เบากว่าเสียงพูด
         af.push(`[2:a]aresample=48000,volume=0.22[am]`);
-
-        // mix: silent bed + music + voice_delayed
-        // แล้วตัดความยาวให้ totalDur เป๊ะ
         af.push(`[a_sil][am][a_voice_d]amix=inputs=3:duration=longest:dropout_transition=2,atrim=0:${totalDur}[aout]`);
       } else {
-        // ไม่มีเพลง: silent bed + voice_delayed ก็พอ (จะได้มีช่วงก่อน 3s และท้าย 5s เป็นเงียบ)
         af.push(`[a_sil][a_voice_d]amix=inputs=2:duration=longest:dropout_transition=2,atrim=0:${totalDur}[aout]`);
       }
 
@@ -200,17 +247,18 @@ app.post(
         "-map", "[vout]",
         "-map", "[aout]",
         "-c:v", "libx264",
-        "-preset", "veryfast",
+        "-preset", "veryfast",      // ถ้ายัง OOM/ช้า ลอง "ultrafast"
         "-crf", "23",
         "-pix_fmt", "yuv420p",
+        "-threads", FFMPEG_THREADS, // ช่วยคุม peak RAM
         "-c:a", "aac",
         "-b:a", "192k",
         "-movflags", "+faststart",
-        "-t", String(totalDur),        // ล็อกจบทุกอย่างตาม totalDur
+        "-t", String(totalDur),     // ล็อกจบตาม totalDur
         outPath
       );
 
-      await runCmd("ffmpeg", args);
+      await runCmd("ffmpeg", args, { maxLogKB: 64 });
 
       res.setHeader("Content-Type", "video/mp4");
       res.setHeader("Content-Disposition", `attachment; filename="short.mp4"`);
@@ -218,25 +266,15 @@ app.post(
       const stream = fs.createReadStream(outPath);
       stream.pipe(res);
 
-      stream.on("close", () => {
-        safeUnlink(outPath);
-        safeUnlink(videoFile.path);
-        safeUnlink(voiceFile.path);
-        safeUnlink(musicFile?.path);
-        safeUnlink(logoFile?.path);
-        safeUnlink(subtitleFile?.path);
-        safeUnlink(shiftedSubtitlePath);
-      });
+      // cleanup หลังส่งเสร็จ
+      const done = () => cleanupAll();
+      stream.on("close", done);
+      stream.on("error", done);
+      res.on("close", done);
+      res.on("finish", done);
 
     } catch (err) {
-      safeUnlink(outPath);
-      safeUnlink(videoFile.path);
-      safeUnlink(voiceFile.path);
-      safeUnlink(musicFile?.path);
-      safeUnlink(logoFile?.path);
-      safeUnlink(subtitleFile?.path);
-      safeUnlink(shiftedSubtitlePath);
-
+      cleanupAll();
       return res.status(500).json({ error: String(err?.message || err) });
     }
   }
