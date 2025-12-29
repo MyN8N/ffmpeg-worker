@@ -11,35 +11,37 @@ const upload = multer({ dest: "/tmp" });
 const VOICE_DELAY_SEC = 3;        // เสียงพูดเริ่มที่ 3 วิ
 const TAIL_AFTER_VOICE_SEC = 5;   // พูดจบแล้วเล่นต่ออีก 5 วิ
 
+// ซับให้ “นำหน้าเสียง” กี่วินาที (เสียง 3s, นำหน้า 1s => ซับเริ่ม 2s)
+const SUBTITLE_LEAD_SEC = 1;
+
 // ===== Performance / RAM knobs =====
 const FFMPEG_LOGLEVEL = "warning";
 const FFMPEG_THREADS = "1";
 const OUT_W = 1080;
 const OUT_H = 1920;
 
-// ===== Subtitle knobs =====
-// ให้ซับเริ่มก่อนเสียงพูดเล็กน้อย: เริ่มที่ 2 วินาที (เสียงเริ่ม 3 วินาที)
-const SUBTITLE_START_SEC = 2;
-
-// ลดขนาดซับลง ~50% จากที่คุณใช้อยู่ (34 -> 18)
+// ===== Subtitle style knobs =====
 const SUBTITLE_FONT = "Arial";
-const SUBTITLE_FONT_SIZE = 18;
 
-// ซับได้สูงสุด 3 บรรทัด
+// ✅ ลดขนาดลงเยอะขึ้น (ของเดิม 54 ใหญ่มาก)
+// ถ้าอยากเล็ก/ใหญ่ เพิ่ม-ลดตรงนี้
+const SUBTITLE_FONT_SIZE = 26;
+
+// ✅ สูงสุด 3 บรรทัด
 const SUBTITLE_MAX_LINES = 3;
 
-// จำกัดจำนวนตัวอักษรต่อบรรทัด (ช่วยบังคับความกว้างไม่ให้ล้นจอ)
-// 1080x1920 แนวตั้ง ค่า 28–34 จะอ่านสบาย ลองเริ่มที่ 30
+// จำกัดจำนวนตัวอักษรต่อบรรทัด เพื่อไม่ให้ล้นจอ (ปรับได้)
 const SUBTITLE_MAX_CHARS_PER_LINE = 30;
 
-// ระยะขอบซ้าย-ขวา (ยิ่งมาก ยิ่งไม่ชิดขอบ)
-const SUBTITLE_MARGIN_LR = 90;
+// ✅ ชิดซ้าย-ขวา “มากขึ้น” -> Margin ลดลง
+// (เลขยิ่งน้อย ยิ่งชิดขอบ)
+const SUBTITLE_MARGIN_LR = 25;
 
-// ให้อยู่ “กลางจอ” และเรียงลงมา
-// Alignment=5 (middle-center)
+// ตำแหน่งกลางจอ: Alignment=5 (middle-center)
 const SUBTITLE_ALIGNMENT = 5;
-// MarginV มีผลกับตำแหน่งแนวตั้ง (แม้ Alignment=5 ก็ยังมีผลบางธีม)
-// ปรับเลขนี้เพื่อเลื่อนขึ้น/ลงเล็กน้อย
+
+// เลื่อนขึ้น/ลงจาก “กลางจอ” (0 = กลางพอดี)
+// อยากให้สูงขึ้นให้ “ติดลบ” เช่น -120 (แล้วแต่ฟอนต์)
 const SUBTITLE_MARGIN_V = 0;
 
 // ===== Utils =====
@@ -48,6 +50,7 @@ function safeUnlink(p) {
   try { fs.unlinkSync(p); } catch {}
 }
 
+// เก็บ log ท้าย ๆ จำกัดขนาด (กัน RAM บวม)
 function runCmd(bin, args, { maxLogKB = 64 } = {}) {
   return new Promise((resolve, reject) => {
     const p = spawn(bin, args, { stdio: ["ignore", "pipe", "pipe"] });
@@ -112,8 +115,7 @@ function msToTime(ms) {
 function shiftSrtTimecodes(srtText, offsetMs) {
   const lines = srtText.split(/\r?\n/);
   return lines.map((line) => {
-    const idx = line.indexOf("-->");
-    if (idx === -1) return line;
+    if (!line.includes("-->")) return line;
 
     const parts = line.split("-->");
     if (parts.length !== 2) return line;
@@ -131,7 +133,20 @@ function shiftSrtTimecodes(srtText, offsetMs) {
   }).join("\n");
 }
 
-// word-wrap เป็น <=3 บรรทัด, ไม่หั่นกลางคำ, ถ้าเกินใส่ …
+// อ่านเวลาเริ่มของ cue แรก (กัน shift ซ้อน)
+function getFirstCueStartMs(srtText) {
+  const lines = srtText.split(/\r?\n/);
+  for (const line of lines) {
+    if (line.includes("-->")) {
+      const a = line.split("-->")[0].trim();
+      const aMs = parseTimeToMs(a);
+      if (aMs !== null) return aMs;
+    }
+  }
+  return null;
+}
+
+// wrap เป็น <=3 บรรทัด, ไม่หั่นกลางคำ, ถ้าเกินใส่ …
 function wrapTextToMaxLines(text, maxCharsPerLine, maxLines) {
   const words = String(text).replace(/\s+/g, " ").trim().split(" ").filter(Boolean);
   const lines = [];
@@ -143,7 +158,6 @@ function wrapTextToMaxLines(text, maxCharsPerLine, maxLines) {
   };
 
   for (const w of words) {
-    // ถ้าคำเดี่ยวยาวมาก: ตัดให้พอ (กันล้นแบบสุดโต่ง)
     const word = w.length > maxCharsPerLine ? (w.slice(0, maxCharsPerLine - 1) + "…") : w;
 
     if (!cur) {
@@ -162,7 +176,6 @@ function wrapTextToMaxLines(text, maxCharsPerLine, maxLines) {
 
   if (lines.length < maxLines) pushLine();
 
-  // ถ้ายังเหลือคำ แต่ครบ maxLines แล้ว -> เติม … ที่บรรทัดสุดท้าย
   const usedWords = lines.join(" ").split(" ").length;
   if (usedWords < words.length && lines.length > 0) {
     if (!lines[lines.length - 1].endsWith("…")) lines[lines.length - 1] += "…";
@@ -171,13 +184,12 @@ function wrapTextToMaxLines(text, maxCharsPerLine, maxLines) {
   return lines.slice(0, maxLines);
 }
 
-// ทำให้ SRT แต่ละบล็อกเป็น 1–3 บรรทัด (แทนที่จะยาวบรรทัดเดียวล้นจอ)
 function normalizeSrtToMaxLines(srtText, maxCharsPerLine, maxLines) {
   const blocks = srtText.split(/\r?\n\r?\n/);
 
   const out = blocks.map((blk) => {
     const lines = blk.split(/\r?\n/).filter(l => l !== "");
-    if (lines.length < 3) return blk; // block แปลก ๆ ปล่อยผ่าน
+    if (lines.length < 3) return blk;
 
     const idxLine = lines[0];
     const timeLine = lines[1];
@@ -198,8 +210,11 @@ function normalizeSrtToMaxLines(srtText, maxCharsPerLine, maxLines) {
  * - video (required)
  * - voice (required)
  * - music (optional)
- * - subtitle (optional) .srt (timestamp เริ่มที่ 0s ของเสียงพูด)
+ * - subtitle (optional) .srt
  * - logo (optional) .png
+ *
+ * optional form field:
+ * - subtitle_offset_sec (number)  // ถ้าอยากกำหนดเองจาก n8n
  */
 app.post(
   "/render",
@@ -223,11 +238,6 @@ app.post(
     const logoFile = req.files?.logo?.[0] || null;
 
     const outPath = path.join("/tmp", `out_${Date.now()}.mp4`);
-
-    // ✅ ซับเริ่มที่ 2 วินาที (ก่อนเสียงที่เริ่ม 3 วินาที)
-    // เพราะ SRT ของคุณอิงจากเสียงพูดเริ่ม 0s -> เลื่อนทั้งชุดเป็น +2s
-    const subtitleOffsetMs = SUBTITLE_START_SEC * 1000;
-
     let processedSubtitlePath = null;
 
     const cleanupAll = () => {
@@ -244,20 +254,39 @@ app.post(
       const voiceDur = await getMediaDurationSeconds(voiceFile.path);
       const totalDur = voiceDur + VOICE_DELAY_SEC + TAIL_AFTER_VOICE_SEC;
 
-      // 1) subtitle: wrap <=3 lines + shift to start at 2s
+      // ✅ คุม offset ของซับ:
+      // - default: ให้ซับเริ่มที่ (VOICE_DELAY_SEC - SUBTITLE_LEAD_SEC) = 2s
+      // - แต่ถ้า n8n ส่ง subtitle_offset_sec มา ให้ใช้ค่านั้น
+      let desiredSubtitleOffsetSec = Math.max(0, VOICE_DELAY_SEC - SUBTITLE_LEAD_SEC);
+      if (req.body?.subtitle_offset_sec !== undefined) {
+        const v = Number(req.body.subtitle_offset_sec);
+        if (Number.isFinite(v)) desiredSubtitleOffsetSec = Math.max(0, v);
+      }
+      const desiredSubtitleOffsetMs = Math.round(desiredSubtitleOffsetSec * 1000);
+
+      // 1) subtitle: wrap <=3 lines + shift (กัน shift ซ้อน)
       if (subtitleFile) {
         const raw = fs.readFileSync(subtitleFile.path, "utf8");
 
+        // ทำให้ 1 block เป็น 1–3 บรรทัด (อ่านรู้เรื่อง)
         const normalized = normalizeSrtToMaxLines(
           raw,
           SUBTITLE_MAX_CHARS_PER_LINE,
           SUBTITLE_MAX_LINES
         );
 
-        const shifted = shiftSrtTimecodes(normalized, subtitleOffsetMs);
+        // กัน “shift ซ้อน”:
+        // ถ้า cue แรกเริ่มเกิน 1.5s อยู่แล้ว แปลว่ามันถูกเลื่อนมาแล้ว (เช่น +3)
+        // เราจะ “ไม่ shift เพิ่ม” เพื่อไม่ให้กลายเป็น 5 วินาที
+        const firstStart = getFirstCueStartMs(normalized);
+        const alreadyShifted = firstStart !== null && firstStart >= 1500;
+
+        const finalSrt = alreadyShifted
+          ? normalized
+          : shiftSrtTimecodes(normalized, desiredSubtitleOffsetMs);
 
         processedSubtitlePath = path.join("/tmp", `subtitle_${Date.now()}.srt`);
-        fs.writeFileSync(processedSubtitlePath, shifted, "utf8");
+        fs.writeFileSync(processedSubtitlePath, finalSrt, "utf8");
       }
 
       // 2) ffmpeg inputs
@@ -280,35 +309,30 @@ app.post(
       const vf = [];
       const af = [];
 
-      // --- Video base
       vf.push(
         `[0:v]scale=${OUT_W}:${OUT_H}:force_original_aspect_ratio=increase,` +
         `crop=${OUT_W}:${OUT_H},setsar=1,fps=30,` +
         `trim=duration=${totalDur},setpts=PTS-STARTPTS[v0]`
       );
 
-      // --- Subtitles style: กลางจอ, ขนาดเล็กลง, จำกัดขอบซ้าย-ขวา
       if (processedSubtitlePath) {
         const forceStyle =
           `FontName=${SUBTITLE_FONT},` +
           `FontSize=${SUBTITLE_FONT_SIZE},` +
           `PrimaryColour=&H00FFFFFF,` +
           `OutlineColour=&H00000000,` +
-          `BorderStyle=1,Outline=2,Shadow=1,` +
+          `BorderStyle=1,Outline=3,Shadow=1,` +
           `Alignment=${SUBTITLE_ALIGNMENT},` +
           `MarginL=${SUBTITLE_MARGIN_LR},` +
           `MarginR=${SUBTITLE_MARGIN_LR},` +
           `MarginV=${SUBTITLE_MARGIN_V},` +
-          `WrapStyle=0`; // 0 = smart wrapping (ใช้ได้กับหลายบรรทัด)
+          `WrapStyle=2`; // 2 = smart wrapping (มักโอเคกับหลายบรรทัด)
 
-        vf.push(
-          `[v0]subtitles=${processedSubtitlePath}:force_style='${forceStyle}'[v1]`
-        );
+        vf.push(`[v0]subtitles=${processedSubtitlePath}:force_style='${forceStyle}'[v1]`);
       } else {
         vf.push(`[v0]null[v1]`);
       }
 
-      // --- Logo overlay (มุมขวาบน)
       if (logoFile) {
         const logoIndex = musicFile ? 3 : 2;
         vf.push(`[${logoIndex}:v]scale=220:-1[lg]`);
@@ -317,7 +341,7 @@ app.post(
         vf.push(`[v1]null[vout]`);
       }
 
-      // --- Audio timeline: voice เริ่มที่ 3s เหมือนเดิม
+      // --- Audio: voice เริ่มที่ 3s
       const voiceDelayMs = VOICE_DELAY_SEC * 1000;
 
       af.push(`anullsrc=channel_layout=stereo:sample_rate=48000,atrim=0:${totalDur}[a_sil]`);
