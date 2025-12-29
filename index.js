@@ -24,7 +24,7 @@ const OUT_H = 1920;
 const SUBTITLE_FONT = "Arial";
 
 // ✅ ลดขนาดลง (ถ้ายังใหญ่ไป ลดอีก เช่น 22 / 20)
-const SUBTITLE_FONT_SIZE = 26;
+const SUBTITLE_FONT_SIZE = 8;
 
 // ✅ สูงสุด 3 บรรทัด
 const SUBTITLE_MAX_LINES = 3;
@@ -33,7 +33,7 @@ const SUBTITLE_MAX_LINES = 3;
 const SUBTITLE_MAX_CHARS_PER_LINE = 30;
 
 // ✅ ชิดซ้าย-ขวา “มากขึ้น” -> Margin ลดลง
-const SUBTITLE_MARGIN_LR = 25;
+const SUBTITLE_MARGIN_LR = 15;
 
 // ตำแหน่ง “กลางจอ”: Alignment=5 (middle-center)
 const SUBTITLE_ALIGNMENT = 5;
