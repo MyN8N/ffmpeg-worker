@@ -30,7 +30,7 @@ const SUBTITLE_FONT_SIZE = 8;
 const SUBTITLE_MAX_LINES = 3;
 
 // จำกัดจำนวนตัวอักษรต่อบรรทัด เพื่อไม่ให้ล้นจอ (ปรับได้)
-const SUBTITLE_MAX_CHARS_PER_LINE = 50;
+const SUBTITLE_MAX_CHARS_PER_LINE = 40;
 
 // ✅ ชิดซ้าย-ขวา “มากขึ้น” -> Margin ลดลง
 const SUBTITLE_MARGIN_LR = 15;
@@ -40,7 +40,7 @@ const SUBTITLE_ALIGNMENT = 5;
 
 // เลื่อนขึ้น/ลงจาก “กลางจอ” (0 = กลางพอดี)
 // ถ้าอยากให้สูงขึ้นให้ “ติดลบ” เช่น -120
-const SUBTITLE_MARGIN_V = 50;
+const SUBTITLE_MARGIN_V = 200;
 
 // ===== Utils =====
 function safeUnlink(p) {
