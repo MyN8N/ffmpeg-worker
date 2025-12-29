@@ -327,7 +327,7 @@ app.post(
           `FontSize=${SUBTITLE_FONT_SIZE},` +
           `PrimaryColour=&H00FFFFFF,` +
           `OutlineColour=&H00000000,` +
-          `BorderStyle=1,Outline=3,Shadow=1,` +
+          `BorderStyle=1,Outline=1,Shadow=1,` +
           `Alignment=${SUBTITLE_ALIGNMENT},` +
           `MarginL=${SUBTITLE_MARGIN_LR},` +
           `MarginR=${SUBTITLE_MARGIN_LR},` +
