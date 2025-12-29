@@ -23,8 +23,7 @@ const OUT_H = 1920;
 // ===== Subtitle style knobs =====
 const SUBTITLE_FONT = "Arial";
 
-// ✅ ลดขนาดลงเยอะขึ้น (ของเดิม 54 ใหญ่มาก)
-// ถ้าอยากเล็ก/ใหญ่ เพิ่ม-ลดตรงนี้
+// ✅ ลดขนาดลง (ถ้ายังใหญ่ไป ลดอีก เช่น 22 / 20)
 const SUBTITLE_FONT_SIZE = 26;
 
 // ✅ สูงสุด 3 บรรทัด
@@ -34,14 +33,13 @@ const SUBTITLE_MAX_LINES = 3;
 const SUBTITLE_MAX_CHARS_PER_LINE = 30;
 
 // ✅ ชิดซ้าย-ขวา “มากขึ้น” -> Margin ลดลง
-// (เลขยิ่งน้อย ยิ่งชิดขอบ)
 const SUBTITLE_MARGIN_LR = 25;
 
-// ตำแหน่งกลางจอ: Alignment=5 (middle-center)
+// ตำแหน่ง “กลางจอ”: Alignment=5 (middle-center)
 const SUBTITLE_ALIGNMENT = 5;
 
 // เลื่อนขึ้น/ลงจาก “กลางจอ” (0 = กลางพอดี)
-// อยากให้สูงขึ้นให้ “ติดลบ” เช่น -120 (แล้วแต่ฟอนต์)
+// ถ้าอยากให้สูงขึ้นให้ “ติดลบ” เช่น -120
 const SUBTITLE_MARGIN_V = 0;
 
 // ===== Utils =====
@@ -204,6 +202,14 @@ function normalizeSrtToMaxLines(srtText, maxCharsPerLine, maxLines) {
   return out.join("\n\n") + "\n";
 }
 
+// ffmpeg subtitles filter ต้อง escape ":" และ "\" บางกรณี (กันพังเวลา path มีอักขระพิเศษ)
+function escapeForSubtitlesFilter(p) {
+  // สำหรับ linux /tmp ปกติไม่ต้อง แต่ใส่ไว้กันพังในอนาคต
+  // libass ใช้ : เป็น delimiter ดังนั้นต้อง escape เป็น \:
+  // และ backslash ต้อง escape เพิ่ม
+  return String(p).replace(/\\/g, "\\\\").replace(/:/g, "\\:");
+}
+
 /**
  * POST /render
  * form-data binary fields:
@@ -276,8 +282,8 @@ app.post(
         );
 
         // กัน “shift ซ้อน”:
-        // ถ้า cue แรกเริ่มเกิน 1.5s อยู่แล้ว แปลว่ามันถูกเลื่อนมาแล้ว (เช่น +3)
-        // เราจะ “ไม่ shift เพิ่ม” เพื่อไม่ให้กลายเป็น 5 วินาที
+        // - ถ้า cue แรกเริ่มใกล้ 0 => ยังไม่ shift -> shift ให้ไป 2s
+        // - ถ้า cue แรกเริ่ม >= ~1.5s (เช่น 2s/3s) => ถือว่าถูกเลื่อนมาแล้ว -> ไม่ shift เพิ่ม
         const firstStart = getFirstCueStartMs(normalized);
         const alreadyShifted = firstStart !== null && firstStart >= 1500;
 
@@ -326,15 +332,17 @@ app.post(
           `MarginL=${SUBTITLE_MARGIN_LR},` +
           `MarginR=${SUBTITLE_MARGIN_LR},` +
           `MarginV=${SUBTITLE_MARGIN_V},` +
-          `WrapStyle=2`; // 2 = smart wrapping (มักโอเคกับหลายบรรทัด)
+          `WrapStyle=2`; // 2 = smart wrapping
 
-        vf.push(`[v0]subtitles=${processedSubtitlePath}:force_style='${forceStyle}'[v1]`);
+        const subPath = escapeForSubtitlesFilter(processedSubtitlePath);
+        vf.push(`[v0]subtitles=${subPath}:force_style='${forceStyle}'[v1]`);
       } else {
         vf.push(`[v0]null[v1]`);
       }
 
+      // Logo overlay (มุมขวาบน)
       if (logoFile) {
-        const logoIndex = musicFile ? 3 : 2;
+        const logoIndex = musicFile ? 3 : 2; // 0 video, 1 voice, 2 music(if any), 2/3 logo
         vf.push(`[${logoIndex}:v]scale=220:-1[lg]`);
         vf.push(`[v1][lg]overlay=W-w-40:40:format=auto[vout]`);
       } else {
@@ -394,4 +402,5 @@ app.post(
 );
 
 app.get("/", (req, res) => res.json({ ok: true, endpoint: "/render" }));
-app.listen(3000, () => console.log("FFmpeg worker listening on :3000"));
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => console.log(`FFmpeg worker listening on :${PORT}`));
