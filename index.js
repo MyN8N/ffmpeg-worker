@@ -166,7 +166,9 @@ function getFirstCueStartMs(srtText) {
   return null;
 }
 function wrapTextToMaxLines(text, maxCharsPerLine, maxLines) {
-  const words = String(text).replace(/\s+/g, " सुनिश्चित)?? "," ").trim().split(" ").filter(Boolean);
+  // ✅ FIX: normalize spaces correctly (English subtitles)
+  const words = String(text).replace(/\s+/g, " ").trim().split(" ").filter(Boolean);
+
   const lines = [];
   let cur = "";
 
@@ -304,12 +306,12 @@ async function processJob(jobId) {
         `PrimaryColour=&H00FFFFFF,` +
         `OutlineColour=&H00000000,` +
         `BorderStyle=1,` +
-        `Outline=${SUBTITLE_OUTLINE},` +   // << “ขอบดำ/สโตรก” อยู่ตรงนี้
-        `Shadow=${SUBTITLE_SHADOW},` +     // << เงาอยู่ตรงนี้
+        `Outline=${SUBTITLE_OUTLINE},` +
+        `Shadow=${SUBTITLE_SHADOW},` +
         `Alignment=${SUBTITLE_ALIGNMENT},` +
         `MarginL=${SUBTITLE_MARGIN_LR},` +
         `MarginR=${SUBTITLE_MARGIN_LR},` +
-        `MarginV=${SUBTITLE_MARGIN_V},` + // << “เลื่อนตำแหน่ง” อยู่ตรงนี้
+        `MarginV=${SUBTITLE_MARGIN_V},` +
         `WrapStyle=2`;
 
       const subPath = escapeForSubtitlesFilter(processedSubtitlePath);
@@ -320,8 +322,8 @@ async function processJob(jobId) {
 
     // Logo overlay
     if (logoPath) {
-      const logoIndex = musicPath ? 3 : 2; // 0 video, 1 voice, 2 music(if any), 2/3 logo
-      const LOGO_W = 300;                  // << เพิ่มขนาดโลโก้: เพิ่มเลขนี้ (เช่น 220 -> 320)
+      const logoIndex = musicPath ? 3 : 2;
+      const LOGO_W = 300;
       vf.push(`[${logoIndex}:v]scale=${LOGO_W}:-1[lg]`);
       vf.push(`[v1][lg]overlay=W-w-40:40:format=auto[vout]`);
     } else {
@@ -364,7 +366,6 @@ async function processJob(jobId) {
     job.updatedAt = Date.now();
     job.error = null;
 
-    // ลบไฟล์ input ชุดงานเพื่อประหยัดพื้นที่ (คงไว้เฉพาะ out mp4)
     cleanupJobFiles(job);
 
   } catch (err) {
@@ -372,7 +373,6 @@ async function processJob(jobId) {
     job.updatedAt = Date.now();
     job.error = String(err?.message || err);
 
-    // ถ้างานพัง ลบ input/output ทิ้งได้เลย
     safeUnlink(job.resultPath);
     cleanupJobFiles(job);
   }
