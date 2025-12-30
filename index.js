@@ -313,7 +313,7 @@ async function processJob(jobId) {
         `WrapStyle=2`;
 
       const subPath = escapeForSubtitlesFilter(processedSubtitlePath);
-      vf.push(`[v0]subtitles=${subPath}:force_style='${forceStyle}'[v1]`);
+      vf.push(`[v0]subtitles=${subPath}:charenc=UTF-8:force_style='${forceStyle}'[v1]`);
     } else {
       vf.push(`[v0]null[v1]`);
     }
