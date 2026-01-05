@@ -9,7 +9,7 @@ const app = express();
 const upload = multer({ dest: "/tmp" });
 
 // ===================== Timing =====================
-const VOICE_DELAY_SEC = 3;        // เสียงพูดเริ่มที่ 3 วิ
+const VOICE_DELAY_SEC = 2;        // เสียงพูดเริ่มที่ 3 วิ
 const TAIL_AFTER_VOICE_SEC = 5;   // พูดจบแล้วเล่นต่ออีก 5 วิ
 const SUBTITLE_LEAD_SEC = 1;      // ซับนำหน้าเสียง 1 วิ => เริ่มที่ 2 วิ
 
@@ -24,7 +24,7 @@ const SUBTITLE_FONT = "Arial";
 const SUBTITLE_FONT_SIZE = 8;        // << ปรับขนาดซับ (คุณอยากลด 50% ก็ลดเลขนี้)
 const SUBTITLE_MAX_LINES = 3;
 const SUBTITLE_MAX_CHARS_PER_LINE = 40;
-const SUBTITLE_MARGIN_LR = 15;
+const SUBTITLE_MARGIN_LR = 18;
 
 // ตำแหน่งซับ: 5 = กลางจอ (middle-center)
 const SUBTITLE_ALIGNMENT = 5;
