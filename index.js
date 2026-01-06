@@ -24,7 +24,7 @@ const SUBTITLE_FONT = "Arial";
 const SUBTITLE_FONT_SIZE = 8;        // << ปรับขนาดซับ (คุณอยากลด 50% ก็ลดเลขนี้)
 const SUBTITLE_MAX_LINES = 3;
 const SUBTITLE_MAX_CHARS_PER_LINE = 40;
-const SUBTITLE_MARGIN_LR = 18;
+const SUBTITLE_MARGIN_LR = 20;
 
 // ตำแหน่งซับ: 5 = กลางจอ (middle-center)
 const SUBTITLE_ALIGNMENT = 5;
