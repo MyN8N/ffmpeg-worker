@@ -118,6 +118,51 @@ async function getMediaDurationSeconds(filePath) {
   return v;
 }
 
+// ===================== Voice helpers (b64 -> file) =====================
+function parseRateFromMime(mime) {
+  const m = String(mime || "").match(/rate=(\d+)/i);
+  const rate = m ? Number(m[1]) : NaN;
+  return Number.isFinite(rate) && rate > 0 ? rate : 24000;
+}
+
+async function saveVoiceFromB64ToFile({ b64, mime, jobId }) {
+  const safeMime = String(mime || "").toLowerCase();
+
+  const rawPath = path.join(JOB_DIR, `voice_raw_${jobId}`);
+  const outWavPath = path.join(JOB_DIR, `voice_${jobId}.wav`);
+
+  const buf = Buffer.from(String(b64 || ""), "base64");
+  fs.writeFileSync(rawPath, buf);
+
+  // PCM from Gemini (audio/L16;codec=pcm;rate=24000) -> WAV
+  if (safeMime.includes("audio/l16") || safeMime.includes("codec=pcm") || safeMime.includes("pcm")) {
+    const rate = parseRateFromMime(safeMime);
+
+    await runCmd("ffmpeg", [
+      "-hide_banner", "-loglevel", FFMPEG_LOGLEVEL,
+      "-f", "s16le",
+      "-ar", String(rate),
+      "-ac", "1",
+      "-i", rawPath,
+      "-y",
+      outWavPath,
+    ]);
+
+    safeUnlink(rawPath);
+    return outWavPath;
+  }
+
+  // already encoded (mp3/wav/other) -> keep bytes, add extension when known
+  let ext = "";
+  if (safeMime.includes("audio/mpeg") || safeMime.includes("audio/mp3")) ext = ".mp3";
+  else if (safeMime.includes("audio/wav") || safeMime.includes("audio/x-wav")) ext = ".wav";
+
+  const finalPath = ext ? `${rawPath}${ext}` : rawPath;
+  if (finalPath !== rawPath) fs.renameSync(rawPath, finalPath);
+
+  return finalPath;
+}
+
 // ===== SRT helpers =====
 function parseTimeToMs(t) {
   const m = /^(\d{2}):(\d{2}):(\d{2}),(\d{3})$/.exec(t.trim());
@@ -408,8 +453,12 @@ app.post(
     const videoFile = req.files?.video?.[0];
     const voiceFile = req.files?.voice?.[0];
 
-    if (!videoFile || !voiceFile) {
-      return res.status(400).json({ error: "Missing required files: video, voice" });
+    // รองรับ voice แบบ base64 จาก form field (voice_b64, voice_mime)
+    const voiceB64 = req.body?.voice_b64;
+    const voiceMime = req.body?.voice_mime;
+
+    if (!videoFile || (!voiceFile && !voiceB64)) {
+      return res.status(400).json({ error: "Missing required files: video, voice (or voice_b64)" });
     }
 
     const musicFile = req.files?.music?.[0] || null;
@@ -418,6 +467,15 @@ app.post(
 
     const jobId = genJobId();
 
+    let voicePathResolved = voiceFile?.path;
+    if (!voicePathResolved && voiceB64) {
+      voicePathResolved = await saveVoiceFromB64ToFile({
+        b64: voiceB64,
+        mime: voiceMime,
+        jobId,
+      });
+    }
+
     jobs.set(jobId, {
       jobId,
       status: "queued",
@@ -425,7 +483,7 @@ app.post(
       updatedAt: Date.now(),
       // store file paths
       videoPath: videoFile.path,
-      voicePath: voiceFile.path,
+      voicePath: voicePathResolved,
       musicPath: musicFile?.path || null,
       subtitlePath: subtitleFile?.path || null,
       logoPath: logoFile?.path || null,
