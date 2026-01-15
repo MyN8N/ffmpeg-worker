@@ -6,14 +6,7 @@ const crypto = require("crypto");
 const { spawn } = require("child_process");
 
 const app = express();
-
-// ✅ CHANGE 1: increase multer fieldSize so voice_b64 won't crash (base64 is big)
-const upload = multer({
-  dest: "/tmp",
-  limits: {
-    fieldSize: 100 * 1024 * 1024, // 100MB for large base64 fields
-  },
-});
+const upload = multer({ dest: "/tmp" });
 
 // ===================== Timing =====================
 const VOICE_DELAY_SEC = 2;        // เสียงพูดเริ่มที่ 3 วิ
@@ -123,16 +116,6 @@ async function getMediaDurationSeconds(filePath) {
   const v = parseFloat(String(stdout).trim());
   if (!Number.isFinite(v) || v <= 0) throw new Error("Cannot read duration from ffprobe");
   return v;
-}
-
-// ✅ CHANGE 2: duration helper for raw PCM (s16le)
-function getPcmDurationSeconds(filePath, sampleRate, channels) {
-  const st = fs.statSync(filePath);
-  const bytes = st.size;
-  const ch = Math.max(1, Number(channels) || 1);
-  const sr = Math.max(1, Number(sampleRate) || 24000);
-  // s16le => 2 bytes per sample
-  return bytes / (2 * ch * sr);
 }
 
 // ===== SRT helpers =====
@@ -250,21 +233,13 @@ async function processJob(jobId) {
   const {
     videoPath, voicePath, musicPath, subtitlePath, logoPath,
     subtitle_offset_sec,
-    // ✅ CHANGE 3: pcm flags
-    voice_is_pcm,
-    voice_rate,
-    voice_channels,
   } = job;
 
   const outPath = path.join(JOB_DIR, `out_${jobId}.mp4`);
   job.resultPath = outPath;
 
   try {
-    // ✅ CHANGE 4: duration method for pcm vs normal media
-    const voiceDur = voice_is_pcm
-      ? getPcmDurationSeconds(voicePath, voice_rate, voice_channels)
-      : await getMediaDurationSeconds(voicePath);
-
+    const voiceDur = await getMediaDurationSeconds(voicePath);
     const totalDur = voiceDur + VOICE_DELAY_SEC + TAIL_AFTER_VOICE_SEC;
 
     // subtitle offset: default ให้เริ่ม 2s (3-1)
@@ -306,14 +281,8 @@ async function processJob(jobId) {
     // 0: video loop
     args.push("-stream_loop", "-1", "-i", videoPath);
 
-    // 1: voice (pcm needs input format)
-    if (voice_is_pcm) {
-      const sr = Math.max(1, Number(voice_rate) || 24000);
-      const ch = Math.max(1, Number(voice_channels) || 1);
-      args.push("-f", "s16le", "-ar", String(sr), "-ac", String(ch), "-i", voicePath);
-    } else {
-      args.push("-i", voicePath);
-    }
+    // 1: voice
+    args.push("-i", voicePath);
 
     // 2: music loop (optional)
     if (musicPath) args.push("-stream_loop", "-1", "-i", musicPath);
@@ -430,7 +399,7 @@ app.post(
   "/render",
   upload.fields([
     { name: "video", maxCount: 1 },
-    { name: "voice", maxCount: 1 },    // optional now (can be missing if voice_b64 provided)
+    { name: "voice", maxCount: 1 },
     { name: "music", maxCount: 1 },
     { name: "subtitle", maxCount: 1 },
     { name: "logo", maxCount: 1 },
@@ -439,14 +408,8 @@ app.post(
     const videoFile = req.files?.video?.[0];
     const voiceFile = req.files?.voice?.[0];
 
-    // ✅ CHANGE 5: accept voice_b64 if no voice file
-    const voiceB64 = req.body?.voice_b64 ? String(req.body.voice_b64) : "";
-    const voiceMime = req.body?.voice_mime ? String(req.body.voice_mime) : "";
-    const voiceRate = req.body?.voice_rate ? Number(req.body.voice_rate) : 24000;
-    const voiceChannels = req.body?.voice_channels ? Number(req.body.voice_channels) : 1;
-
-    if (!videoFile || (!voiceFile && !voiceB64)) {
-      return res.status(400).json({ error: "Missing required files: video, voice (or voice_b64)" });
+    if (!videoFile || !voiceFile) {
+      return res.status(400).json({ error: "Missing required files: video, voice" });
     }
 
     const musicFile = req.files?.music?.[0] || null;
@@ -455,22 +418,6 @@ app.post(
 
     const jobId = genJobId();
 
-    // ✅ CHANGE 6: if voice_b64 => write raw pcm file to /tmp
-    let voicePathFinal = voiceFile?.path || null;
-    let voiceIsPcm = false;
-
-    if (!voicePathFinal && voiceB64) {
-      const buf = Buffer.from(voiceB64, "base64");
-      const p = path.join(JOB_DIR, `voice_${jobId}.pcm`);
-      fs.writeFileSync(p, buf);
-      voicePathFinal = p;
-
-      // Gemini mime looks like: "audio/L16;codec=pcm;rate=24000"
-      // We'll treat as raw PCM s16le if it contains "audio/L16" or "pcm"
-      const m = voiceMime.toLowerCase();
-      voiceIsPcm = m.includes("audio/l16") || m.includes("pcm");
-    }
-
     jobs.set(jobId, {
       jobId,
       status: "queued",
@@ -478,7 +425,7 @@ app.post(
       updatedAt: Date.now(),
       // store file paths
       videoPath: videoFile.path,
-      voicePath: voicePathFinal,
+      voicePath: voiceFile.path,
       musicPath: musicFile?.path || null,
       subtitlePath: subtitleFile?.path || null,
       logoPath: logoFile?.path || null,
@@ -486,11 +433,6 @@ app.post(
       resultPath: null,
       processedSubtitlePath: null,
       error: null,
-
-      // ✅ CHANGE 7: store pcm metadata
-      voice_is_pcm: voiceIsPcm,
-      voice_rate: Number.isFinite(voiceRate) ? voiceRate : 24000,
-      voice_channels: Number.isFinite(voiceChannels) ? voiceChannels : 1,
     });
 
     queue.push(jobId);
