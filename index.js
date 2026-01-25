@@ -19,6 +19,12 @@ const FFMPEG_THREADS = "1";
 const OUT_W = 1080;
 const OUT_H = 1920;
 
+// ======= ADDED: output presets (do not change existing OUT_W/OUT_H) =======
+const PORT_W = 1080;
+const PORT_H = 1920;
+const LAND_W = 1920;
+const LAND_H = 1080;
+
 // ===================== Subtitle style knobs =====================
 const SUBTITLE_FONT = "Arial";
 const SUBTITLE_FONT_SIZE = 8;        // << ปรับขนาดซับ (คุณอยากลด 50% ก็ลดเลขนี้)
@@ -116,6 +122,27 @@ async function getMediaDurationSeconds(filePath) {
   const v = parseFloat(String(stdout).trim());
   if (!Number.isFinite(v) || v <= 0) throw new Error("Cannot read duration from ffprobe");
   return v;
+}
+
+// ======= ADDED: auto-detect video dimensions =======
+async function getVideoDimensions(filePath) {
+  const args = [
+    "-v", "error",
+    "-select_streams", "v:0",
+    "-show_entries", "stream=width,height",
+    "-of", "json",
+    filePath,
+  ];
+  const { stdout } = await runCmd("ffprobe", args, { maxLogKB: 16 });
+  try {
+    const j = JSON.parse(String(stdout || "").trim() || "{}");
+    const s = (j.streams && j.streams[0]) ? j.streams[0] : {};
+    const width = Number(s.width) || 0;
+    const height = Number(s.height) || 0;
+    return { width, height };
+  } catch {
+    return { width: 0, height: 0 };
+  }
 }
 
 // ===== SRT helpers =====
@@ -293,9 +320,23 @@ async function processJob(jobId) {
     const vf = [];
     const af = [];
 
+    // ======= ADDED: auto choose output aspect by input video dimensions =======
+    let outW = OUT_W;
+    let outH = OUT_H;
+
+    const { width: inW, height: inH } = await getVideoDimensions(videoPath);
+
+    if (inW && inH && inW >= inH) {
+      outW = LAND_W;
+      outH = LAND_H;
+    } else if (inW && inH && inW < inH) {
+      outW = PORT_W;
+      outH = PORT_H;
+    }
+
     vf.push(
-      `[0:v]scale=${OUT_W}:${OUT_H}:force_original_aspect_ratio=increase,` +
-      `crop=${OUT_W}:${OUT_H},setsar=1,fps=30,` +
+      `[0:v]scale=${outW}:${outH}:force_original_aspect_ratio=increase,` +
+      `crop=${outW}:${outH},setsar=1,fps=30,` +
       `trim=duration=${totalDur},setpts=PTS-STARTPTS[v0]`
     );
 
