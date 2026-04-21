@@ -378,9 +378,9 @@ async function processJob(jobId) {
 
     if (musicPath) {
       af.push(`[2:a]aresample=48000,volume=0.22[am]`);
-      af.push(`[a_sil][am][a_voice_d]amix=inputs=3:duration=longest:dropout_transition=2,atrim=0:${totalDur}[aout]`);
+      af.push(`[a_sil][am][a_voice_d]amix=inputs=3:duration=longest:dropout_transition=2,atrim=0:${totalDur},volume=1.5[aout]`);
     } else {
-      af.push(`[a_sil][a_voice_d]amix=inputs=2:duration=longest:dropout_transition=2,atrim=0:${totalDur}[aout]`);
+      af.push(`[a_sil][a_voice_d]amix=inputs=2:duration=longest:dropout_transition=2,atrim=0:${totalDur},volume=1.5[aout]`);
     }
 
     const filterComplex = [...vf, ...af].join(";");
